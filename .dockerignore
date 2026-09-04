@@ -1,0 +1,8 @@
+# 构建镜像时排除以下内容（尤其不要把 .env 里的 key 打进镜像）
+.env
+data/docs/
+.git/
+bin/
+dist/
+*.exe
+*.docx

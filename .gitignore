@@ -1,0 +1,32 @@
+# 环境变量（含 API key，不要提交）
+.env
+
+# 二进制产物
+/bin/
+*.exe
+dist/
+
+# 抓取下来的语料（保留示例文件）
+data/docs/
+!data/docs/sample_go_notes.md
+
+# 编辑器
+.vscode/
+.idea/
+
+# 忽略 Word / PDF / 文本手册等文档
+*.docx
+*.pdf
+*.txt
+!README.md         # 如果你以后想写 README,保留它
+
+# 忽略下载的语料文件夹（只保留示例文件）
+data/docs/
+!data/docs/sample_go_notes.md
+
+# 忽略二进制可执行文件
+*.exe
+/bin/
+/dist/
+
+data/eval/qa.jsonl
