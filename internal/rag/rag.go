@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"godoc-rag/internal/llm"
 	"godoc-rag/internal/store"
@@ -39,6 +40,15 @@ type Answer struct {
 	Question string   `json:"question"`
 	Answer   string   `json:"answer"`
 	Sources  []Source `json:"sources"` // 引用的来源，便于核查是否有幻觉
+	Timing   Timing   `json:"timing"`  // 各阶段耗时（毫秒），用于评测和性能观测
+}
+
+// Timing 记录一次问答链路各阶段的耗时，单位毫秒。
+type Timing struct {
+	RetrieveMs float64 `json:"retrieve_ms"` // 检索耗时（向量检索 + 关键词检索 + RRF 融合）
+	RerankMs   float64 `json:"rerank_ms"`   // LLM 重排耗时（未启用重排时为 0）
+	GenerateMs float64 `json:"generate_ms"` // LLM 生成答案耗时
+	TotalMs    float64 `json:"total_ms"`    // 端到端总耗时（不含评测 judge 调用）
 }
 
 // Source 是引用的一个资料片段。
@@ -51,18 +61,25 @@ type Source struct {
 
 // Answer 走完整链路回答问题。
 func (r *RAG) Answer(ctx context.Context, question string) (*Answer, error) {
+	start := time.Now()
+
 	qvec, err := r.llm.Embed(ctx, r.cfg.EmbedModel, question, r.cfg.EmbedDim)
 	if err != nil {
 		return nil, fmt.Errorf("向量化问题失败: %w", err)
 	}
 
+	retrieveStart := time.Now()
 	cands, err := r.retrieve(ctx, question, qvec, r.cfg.CandidateK)
+	retrieveMs := msSince(retrieveStart)
 	if err != nil {
 		return nil, err
 	}
 
+	rerankMs := 0.0
 	if r.cfg.UseRerank && len(cands) > r.cfg.TopK {
+		rerankStart := time.Now()
 		cands, err = r.rerank(ctx, question, cands, r.cfg.TopK)
+		rerankMs = msSince(rerankStart)
 		if err != nil {
 			return nil, err
 		}
@@ -70,7 +87,9 @@ func (r *RAG) Answer(ctx context.Context, question string) (*Answer, error) {
 		cands = cands[:r.cfg.TopK]
 	}
 
+	generateStart := time.Now()
 	text, err := r.generate(ctx, question, cands)
+	generateMs := msSince(generateStart)
 	if err != nil {
 		return nil, err
 	}
@@ -79,7 +98,17 @@ func (r *RAG) Answer(ctx context.Context, question string) (*Answer, error) {
 	for _, c := range cands {
 		sources = append(sources, Source{Content: c.Content, Section: c.Section, Source: c.Source, Score: c.Score})
 	}
-	return &Answer{Question: question, Answer: text, Sources: sources}, nil
+	return &Answer{
+		Question: question,
+		Answer:   text,
+		Sources:  sources,
+		Timing: Timing{
+			RetrieveMs: retrieveMs,
+			RerankMs:   rerankMs,
+			GenerateMs: generateMs,
+			TotalMs:    msSince(start),
+		},
+	}, nil
 }
 
 // retrieve 做混合检索：向量检索 + 关键词检索，用 RRF（倒数排名融合）合并。
@@ -196,6 +225,11 @@ func parseIndices(s string, max int) []int {
 		}
 	}
 	return out
+}
+
+// msSince 返回从 t 到现在的耗时，单位毫秒。
+func msSince(t time.Time) float64 {
+	return float64(time.Since(t).Microseconds()) / 1000.0
 }
 
 func truncate(s string, n int) string {

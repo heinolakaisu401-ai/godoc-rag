@@ -59,7 +59,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	var sumFaith, sumRel float64
+	var sumFaith, sumRel, sumRetrieve, sumTotal float64
 	n := 0
 	for i, qa := range qas {
 		ans, err := r.Answer(ctx, qa.Question)
@@ -75,15 +75,17 @@ func main() {
 		n++
 		sumFaith += float64(jr.Faithful)
 		sumRel += float64(jr.Relevant)
-		fmt.Printf("[%d] Q: %s\n    忠实度=%d 相关性=%d\n    A: %s\n\n",
-			i+1, qa.Question, jr.Faithful, jr.Relevant, truncate(ans.Answer, 120))
+		sumRetrieve += ans.Timing.RetrieveMs
+		sumTotal += ans.Timing.TotalMs
+		fmt.Printf("[%d] Q: %s\n    忠实度=%d 相关性=%d 检索耗时=%.2fms 总耗时=%.2fms\n    A: %s\n\n",
+			i+1, qa.Question, jr.Faithful, jr.Relevant, ans.Timing.RetrieveMs, ans.Timing.TotalMs, truncate(ans.Answer, 120))
 	}
 
 	if n == 0 {
 		log.Fatal("没有成功评测任何一条样本，请先导入语料并检查评测集")
 	}
-	fmt.Printf("===== 汇总 =====\n样本数: %d\n忠实度: %.2f\n检索相关性: %.2f\n",
-		n, sumFaith/float64(n), sumRel/float64(n))
+	fmt.Printf("===== 汇总 =====\n样本数: %d\n忠实度: %.2f\n检索相关性: %.2f\n平均检索时间: %.2f ms\n平均端到端时间: %.2f ms\n",
+		n, sumFaith/float64(n), sumRel/float64(n), sumRetrieve/float64(n), sumTotal/float64(n))
 }
 
 // judge 用 LLM 从两个维度给单条结果打分，返回 JSON。
