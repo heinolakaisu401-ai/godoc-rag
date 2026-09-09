@@ -23,12 +23,36 @@ import (
 type QA struct {
 	Question  string `json:"question"`
 	Reference string `json:"reference"` // 参考答案，仅用于辅助 judge 判断
+	Category  string `json:"category"`  // 样本类别(concept / code)，用于分维度统计
 }
 
 // JudgeResult 是 LLM-as-judge 给出的打分。
 type JudgeResult struct {
 	Faithful int `json:"faithful"` // 1=回答忠实于资料，0=存在编造
 	Relevant int `json:"relevant"` // 1=检索到的资料相关，0=不相关
+	Complete int `json:"complete"` // 1=检索资料中的代码块完整，0=存在截断/缺头缺尾
+}
+
+// categoryStats 按样本类别累积评测分数。
+type categoryStats struct {
+	n        int
+	sumFaith float64
+	sumRel   float64
+	sumComp  float64
+}
+
+func (s *categoryStats) add(jr JudgeResult) {
+	s.n++
+	s.sumFaith += float64(jr.Faithful)
+	s.sumRel += float64(jr.Relevant)
+	s.sumComp += float64(jr.Complete)
+}
+
+func (s categoryStats) avg(sum float64) float64 {
+	if s.n == 0 {
+		return 0
+	}
+	return sum / float64(s.n)
 }
 
 func main() {
@@ -59,8 +83,9 @@ func main() {
 		log.Fatal(err)
 	}
 
-	var sumFaith, sumRel, sumRetrieve, sumTotal float64
-	n := 0
+	var sumRetrieve, sumTotal float64
+	total := &categoryStats{}
+	byCat := map[string]*categoryStats{}
 	for i, qa := range qas {
 		ans, err := r.Answer(ctx, qa.Question)
 		if err != nil {
@@ -72,27 +97,38 @@ func main() {
 			log.Printf("[%d] 评测错误: %v", i+1, err)
 			continue
 		}
-		n++
-		sumFaith += float64(jr.Faithful)
-		sumRel += float64(jr.Relevant)
+		cat := qa.Category
+		if cat == "" {
+			cat = "concept"
+		}
+		st := byCat[cat]
+		if st == nil {
+			st = &categoryStats{}
+			byCat[cat] = st
+		}
+		total.add(jr)
+		st.add(jr)
 		sumRetrieve += ans.Timing.RetrieveMs
 		sumTotal += ans.Timing.TotalMs
-		fmt.Printf("[%d] Q: %s\n    忠实度=%d 相关性=%d 检索耗时=%.2fms 总耗时=%.2fms\n    A: %s\n\n",
-			i+1, qa.Question, jr.Faithful, jr.Relevant, ans.Timing.RetrieveMs, ans.Timing.TotalMs, truncate(ans.Answer, 120))
+		fmt.Printf("[%d] Q: %s\n    忠实度=%d 相关性=%d 完整性=%d 检索耗时=%.2fms 总耗时=%.2fms\n    A: %s\n\n",
+			i+1, qa.Question, jr.Faithful, jr.Relevant, jr.Complete, ans.Timing.RetrieveMs, ans.Timing.TotalMs, truncate(ans.Answer, 120))
 	}
 
-	if n == 0 {
+	if total.n == 0 {
 		log.Fatal("没有成功评测任何一条样本，请先导入语料并检查评测集")
 	}
-	fmt.Printf("===== 汇总 =====\n样本数: %d\n忠实度: %.2f\n检索相关性: %.2f\n平均检索时间: %.2f ms\n平均端到端时间: %.2f ms\n",
-		n, sumFaith/float64(n), sumRel/float64(n), sumRetrieve/float64(n), sumTotal/float64(n))
+	fmt.Printf("===== 汇总 =====\n样本数: %d\n忠实度: %.2f\n检索相关性: %.2f\n代码完整性: %.2f\n平均检索时间: %.2f ms\n平均端到端时间: %.2f ms\n",
+		total.n, total.avg(total.sumFaith), total.avg(total.sumRel), total.avg(total.sumComp), sumRetrieve/float64(total.n), sumTotal/float64(total.n))
+	for cat, st := range byCat {
+		fmt.Printf("  [%s] n=%d 忠实度=%.2f 相关性=%.2f 完整性=%.2f\n", cat, st.n, st.avg(st.sumFaith), st.avg(st.sumRel), st.avg(st.sumComp))
+	}
 }
 
 // judge 用 LLM 从两个维度给单条结果打分，返回 JSON。
 func judge(ctx context.Context, c *llm.Client, model string, qa QA, ans *rag.Answer) (JudgeResult, error) {
 	var sb strings.Builder
 	for _, s := range ans.Sources {
-		sb.WriteString("- " + s.Content + "\n")
+		sb.WriteString("- " + truncate(s.Content, 2000) + "\n")
 	}
 
 	prompt := fmt.Sprintf(`你是评测专家。请判断这个 RAG 系统的回答质量。
@@ -103,10 +139,11 @@ func judge(ctx context.Context, c *llm.Client, model string, qa QA, ans *rag.Ans
 %s
 系统回答：%s
 
-请输出一个 JSON：{"faithful": 0或1, "relevant": 0或1}
+请输出一个 JSON：{"faithful": 0或1, "relevant": 0或1, "complete": 0或1}
 - faithful：回答是否忠实于资料（没有编造资料中不存在的内容），1=是 0=否
 - relevant：检索到的资料是否与问题相关，1=相关 0=不相关
-只输出 JSON，不要解释。`, qa.Question, qa.Reference, truncate(sb.String(), 2000), ans.Answer)
+- complete：检索资料中的代码块是否完整（未被截断、缺头或缺尾）；资料不含代码块时记 1；1=完整 0=不完整
+只输出 JSON，不要解释。`, qa.Question, qa.Reference, sb.String(), ans.Answer)
 
 	resp, err := c.Chat(ctx, model, []llm.Message{{Role: "user", Content: prompt}})
 	if err != nil {

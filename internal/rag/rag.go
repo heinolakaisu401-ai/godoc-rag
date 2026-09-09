@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"godoc-rag/internal/chunker"
 	"godoc-rag/internal/llm"
 	"godoc-rag/internal/store"
 )
@@ -53,10 +54,11 @@ type Timing struct {
 
 // Source 是引用的一个资料片段。
 type Source struct {
-	Content string  `json:"content"`
-	Section string  `json:"section"`
-	Source  string  `json:"source"`
-	Score   float64 `json:"score"`
+	Content    string  `json:"content"`
+	Section    string  `json:"section"`
+	Source     string  `json:"source"`
+	Score      float64 `json:"score"`
+	CodeStatus string  `json:"code_status,omitempty"` // 代码块完整性:none/complete/missing_end/missing_start
 }
 
 // Answer 走完整链路回答问题。
@@ -96,7 +98,10 @@ func (r *RAG) Answer(ctx context.Context, question string) (*Answer, error) {
 
 	sources := make([]Source, 0, len(cands))
 	for _, c := range cands {
-		sources = append(sources, Source{Content: c.Content, Section: c.Section, Source: c.Source, Score: c.Score})
+		sources = append(sources, Source{
+			Content: c.Content, Section: c.Section, Source: c.Source, Score: c.Score,
+			CodeStatus: codeStatusOf(c.Content),
+		})
 	}
 	return &Answer{
 		Question: question,
@@ -168,9 +173,13 @@ func (r *RAG) generate(ctx context.Context, q string, ctxChunks []store.Retrieve
 	var sb strings.Builder
 	sb.WriteString("你是一个 Go 语言文档助手。请只根据下面提供的资料回答用户问题。\n")
 	sb.WriteString("如果资料中找不到答案，请明确说「根据现有资料无法回答」，不要编造。\n\n")
+	sb.WriteString("【代码块完整性规则】检索资料中的代码块可能因切分而残缺：\n")
+	sb.WriteString("- 标注「不完整（缺结尾）」的，只依据已给出的部分作答，禁止补全、续写或猜测缺失部分；不要丢弃该段。\n")
+	sb.WriteString("- 标注「不完整（缺开头）」的，只是某段代码的结尾，禁止据此推断完整代码。\n")
+	sb.WriteString("- 若问题必须依赖缺失部分才能回答，请说「该段资料不完整，无法据此给出完整答案」。\n\n")
 	sb.WriteString("资料：\n")
 	for i, c := range ctxChunks {
-		sb.WriteString(fmt.Sprintf("[%d] %s\n", i+1, c.Content))
+		sb.WriteString(fmt.Sprintf("[%d] %s\n", i+1, formatChunk(c.Content)))
 	}
 	sb.WriteString("\n问题：" + q + "\n")
 
@@ -238,4 +247,30 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return string(r[:n]) + "..."
+}
+
+// formatChunk 根据代码块完整性给 chunk 内容加提示前缀，提示 LLM 不要补全/推断残缺代码。
+func formatChunk(content string) string {
+	switch chunker.Summarize(chunker.CheckCodeBlocks(content)) {
+	case chunker.DanglingOpen:
+		return "（代码不完整：缺结尾）以下代码块缺少结尾，请仅使用已给出的上半部分，严禁补全：\n" + content
+	case chunker.DanglingClose:
+		return "（代码不完整：缺开头）以下仅为代码结尾，开头未包含，禁止据此推断完整代码：\n" + content
+	default:
+		return content
+	}
+}
+
+// codeStatusOf 把代码块完整性状态映射为 JSON 友好的字符串，写入返回的 sources 供核查。
+func codeStatusOf(content string) string {
+	switch chunker.Summarize(chunker.CheckCodeBlocks(content)) {
+	case chunker.DanglingOpen:
+		return "missing_end"
+	case chunker.DanglingClose:
+		return "missing_start"
+	case chunker.Complete:
+		return "complete"
+	default:
+		return "none"
+	}
 }
