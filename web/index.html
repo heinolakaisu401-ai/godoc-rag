@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RAG · Agent 流式问答演示</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "Microsoft YaHei", "Segoe UI", sans-serif; max-width: 860px; margin: 0 auto; padding: 24px; line-height: 1.6; color: #1f2328; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { font-size: 13px; color: #888; margin-bottom: 16px; }
+  .toolbar { display: flex; flex-wrap: wrap; gap: 12px; margin: 12px 0; align-items: center; }
+  .toolbar label { font-size: 13px; color: #666; }
+  .toolbar input[type=text] { padding: 6px 8px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; }
+  textarea { width: 100%; height: 72px; padding: 10px; font-size: 15px; border: 1px solid #ccc; border-radius: 8px; resize: vertical; font-family: inherit; }
+  .btns { display: flex; gap: 8px; margin: 12px 0; }
+  button { padding: 8px 16px; font-size: 14px; border: none; border-radius: 8px; cursor: pointer; background: #2563eb; color: #fff; }
+  button.secondary { background: #6b7280; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  #status { font-size: 13px; color: #888; min-height: 18px; margin: 8px 0; }
+  #answer { background: #f6f7f8; border-radius: 10px; padding: 14px 16px; min-height: 60px; white-space: pre-wrap; word-break: break-word; }
+  .cursor { display: inline-block; width: 8px; height: 1em; background: #2563eb; vertical-align: -2px; animation: blink 1s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  #sources { margin-top: 16px; font-size: 13px; }
+  .src { border-left: 3px solid #ddd; padding: 6px 10px; margin: 6px 0; background: #fafafa; border-radius: 4px; white-space: pre-wrap; word-break: break-word; }
+  .src b { color: #333; }
+  .muted { color: #888; font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>RAG · Agent 流式问答演示</h1>
+<div class="sub">后端：LangGraph 风格状态图（Go 实现） · 混合检索 + LLM 重排 · ReAct 工具调用 · SSE 流式输出</div>
+<div class="toolbar">
+  <label>知识库 namespace（/ask）</label>
+  <input type="text" id="namespace" value="go-docs" style="width:120px">
+  <label>会话 session_id（/agent 多轮记忆）</label>
+  <input type="text" id="session" value="demo-1" style="width:120px">
+</div>
+<textarea id="q" placeholder="输入问题，例如：Go 的 defer 是怎么工作的？Rust 的所有权是什么？"></textarea>
+<div class="btns">
+  <button id="askBtn">问 /ask（纯 RAG）</button>
+  <button id="agentBtn" class="secondary">问 /agent（Agent）</button>
+</div>
+<div id="status"></div>
+<div id="answer"><span id="cur"></span></div>
+<div id="sources"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+let busy = false;
+
+async function run(endpoint, payload) {
+  if (busy) return;
+  busy = true;
+  const out = $('answer');
+  out.innerHTML = '<span id="cur"></span>';
+  $('sources').innerHTML = '';
+  $('status').textContent = '生成中…';
+  setButtons(true);
+
+  const cur = () => $('cur');
+  const append = t => { const e = cur(); e.parentNode.insertBefore(document.createTextNode(t), e); };
+  let receivedDelta = false;
+
+  try {
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) { append('HTTP ' + res.status + ' ' + res.statusText); return; }
+
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+        if (!line.startsWith('data:')) continue;
+        let evt;
+        try { evt = JSON.parse(line.slice(5).trim()); } catch { continue; }
+        if (evt.type === 'delta') { receivedDelta = true; append(evt.content); }
+        else if (evt.type === 'done') {
+          if (!receivedDelta) append(evt.answer);
+          if (evt.sources && evt.sources.length) renderSources(evt.sources);
+          $('status').textContent = '完成' + (evt.timing ? '（总耗时 ' + Math.round(evt.timing.total_ms) + ' ms）' : '');
+        } else if (evt.type === 'error') {
+          append('\n[错误] ' + evt.message);
+          $('status').textContent = '出错';
+        }
+      }
+    }
+  } catch (err) {
+    append('\n[请求失败] ' + err.message);
+    $('status').textContent = '出错';
+  } finally {
+    cur().remove();
+    setButtons(false);
+  }
+}
+
+function renderSources(sources) {
+  const box = $('sources');
+  const head = document.createElement('div');
+  head.className = 'muted';
+  head.textContent = '引用来源（' + sources.length + ' 条）：';
+  box.appendChild(head);
+  for (const s of sources) {
+    const div = document.createElement('div');
+    div.className = 'src';
+    div.innerHTML = '<b>' + esc(s.source) + (s.section ? ' · ' + esc(s.section) : '') + '</b>'
+      + ' <span class="muted">score ' + (s.score ? s.score.toFixed(3) : '-') + '</span><br>'
+      + esc(s.content);
+    box.appendChild(div);
+  }
+}
+
+function esc(s) { return (s || '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+function setButtons(v) { $('askBtn').disabled = v; $('agentBtn').disabled = v; }
+
+$('askBtn').onclick = () => run('/ask', {
+  question: $('q').value, namespace: $('namespace').value, stream: true,
+});
+$('agentBtn').onclick = () => run('/agent', {
+  question: $('q').value, session_id: $('session').value, stream: true,
+});
+$('q').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) $('askBtn').click();
+});
+</script>
+</body>
+</html>

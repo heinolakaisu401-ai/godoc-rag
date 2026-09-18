@@ -20,6 +20,7 @@ import (
 func main() {
 	dir := flag.String("dir", "data/docs", "要导入的文档目录")
 	file := flag.String("file", "", "导入单个文件（优先级高于 -dir）")
+	namespace := flag.String("namespace", "go-docs", "知识库命名空间（多知识库隔离）")
 	flag.Parse()
 
 	cfg, err := config.Load()
@@ -67,7 +68,7 @@ func main() {
 			if err != nil {
 				log.Fatalf("向量化 %s 失败: %v", f, err)
 			}
-			if err := st.Insert(ctx, filepath.Base(f), ch.Section, ch.Text, emb); err != nil {
+			if err := st.Insert(ctx, *namespace, filepath.Base(f), ch.Section, ch.Text, emb); err != nil {
 				log.Fatalf("写入 %s 失败: %v", f, err)
 			}
 			total++

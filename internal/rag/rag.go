@@ -1,5 +1,8 @@
 // Package rag 编排完整的检索增强生成（RAG）链路：
 // embed 问题 → 混合检索（向量 + 关键词）→ 重排 → 拼 prompt 生成答案。
+//
+// 链路由 internal/graph 的状态图引擎（LangGraph 风格）驱动：检索、重排、生成
+// 各自是一个节点，条件边负责路由，见 buildGraph。
 package rag
 
 import (
@@ -10,6 +13,7 @@ import (
 	"time"
 
 	"godoc-rag/internal/chunker"
+	"godoc-rag/internal/graph"
 	"godoc-rag/internal/llm"
 	"godoc-rag/internal/store"
 )
@@ -19,9 +23,10 @@ type Config struct {
 	LLMModel   string
 	EmbedModel string
 	EmbedDim   int
-	TopK       int  // 最终喂给 LLM 的上下文块数
-	CandidateK int  // 检索阶段返回的候选数（先多召回，再重排精选）
-	UseRerank  bool // 是否启用 LLM 重排
+	Namespace  string // 知识库命名空间（默认 go-docs）
+	TopK       int    // 最终喂给 LLM 的上下文块数
+	CandidateK int    // 检索阶段返回的候选数（先多召回，再重排精选）
+	UseRerank  bool   // 是否启用 LLM 重排
 }
 
 // RAG 是核心结构。
@@ -33,7 +38,19 @@ type RAG struct {
 
 // New 构建 RAG 实例。
 func New(llmClient *llm.Client, st *store.Store, cfg Config) *RAG {
+	if cfg.Namespace == "" {
+		cfg.Namespace = "go-docs"
+	}
 	return &RAG{llm: llmClient, store: st, cfg: cfg}
+}
+
+// WithNamespace 返回一个检索指定知识库的 RAG 副本（浅拷贝，共享 LLM 客户端与存储）。
+func (r *RAG) WithNamespace(ns string) *RAG {
+	c := *r
+	if ns != "" {
+		c.cfg.Namespace = ns
+	}
+	return &c
 }
 
 // Answer 是最终返回给用户的结果。
@@ -61,43 +78,34 @@ type Source struct {
 	CodeStatus string  `json:"code_status,omitempty"` // 代码块完整性:none/complete/missing_end/missing_start
 }
 
-// Answer 走完整链路回答问题。
+// Answer 走 LangGraph 风格的状态图回答问题：
+// 把「检索 → 重排 → 路由 → 生成」拆成显式节点，由状态图引擎驱动，
+// 支持条件分支（检索为空时优雅兜底，不浪费一次 LLM 调用）。
 func (r *RAG) Answer(ctx context.Context, question string) (*Answer, error) {
 	start := time.Now()
-
-	qvec, err := r.llm.Embed(ctx, r.cfg.EmbedModel, question, r.cfg.EmbedDim)
-	if err != nil {
-		return nil, fmt.Errorf("向量化问题失败: %w", err)
-	}
-
-	retrieveStart := time.Now()
-	cands, err := r.retrieve(ctx, question, qvec, r.cfg.CandidateK)
-	retrieveMs := msSince(retrieveStart)
+	state, err := r.buildGraph(nil).Run(ctx, graph.State{stateQuestion: question})
 	if err != nil {
 		return nil, err
 	}
+	return r.finishAnswer(question, start, state), nil
+}
 
-	rerankMs := 0.0
-	if r.cfg.UseRerank && len(cands) > r.cfg.TopK {
-		rerankStart := time.Now()
-		cands, err = r.rerank(ctx, question, cands, r.cfg.TopK)
-		rerankMs = msSince(rerankStart)
-		if err != nil {
-			return nil, err
-		}
-	} else if len(cands) > r.cfg.TopK {
-		cands = cands[:r.cfg.TopK]
-	}
-
-	generateStart := time.Now()
-	text, err := r.generate(ctx, question, cands)
-	generateMs := msSince(generateStart)
+// AnswerStream 与 Answer 相同，但最终答案以流式逐字回调 onDelta（配合 SSE 打字机效果）。
+// 检索、重排阶段照旧同步执行，只有生成阶段流式吐字。
+func (r *RAG) AnswerStream(ctx context.Context, question string, onDelta func(string) error) (*Answer, error) {
+	start := time.Now()
+	state, err := r.buildGraph(onDelta).Run(ctx, graph.State{stateQuestion: question})
 	if err != nil {
 		return nil, err
 	}
+	return r.finishAnswer(question, start, state), nil
+}
 
-	sources := make([]Source, 0, len(cands))
-	for _, c := range cands {
+// finishAnswer 把状态图的最终状态整理成 Answer 返回值。
+func (r *RAG) finishAnswer(question string, start time.Time, state graph.State) *Answer {
+	contexts := state[stateContexts].([]store.Retrieved)
+	sources := make([]Source, 0, len(contexts))
+	for _, c := range contexts {
 		sources = append(sources, Source{
 			Content: c.Content, Section: c.Section, Source: c.Source, Score: c.Score,
 			CodeStatus: codeStatusOf(c.Content),
@@ -105,24 +113,33 @@ func (r *RAG) Answer(ctx context.Context, question string) (*Answer, error) {
 	}
 	return &Answer{
 		Question: question,
-		Answer:   text,
+		Answer:   state[stateAnswer].(string),
 		Sources:  sources,
 		Timing: Timing{
-			RetrieveMs: retrieveMs,
-			RerankMs:   rerankMs,
-			GenerateMs: generateMs,
+			RetrieveMs: state[stateRetrieveMs].(float64),
+			RerankMs:   state[stateRerankMs].(float64),
+			GenerateMs: state[stateGenerateMs].(float64),
 			TotalMs:    msSince(start),
 		},
-	}, nil
+	}
+}
+
+// Search 做一次混合检索，返回最相关的 topK 个片段。供 agent 的「查文档」工具调用。
+func (r *RAG) Search(ctx context.Context, query string, topK int) ([]store.Retrieved, error) {
+	qvec, err := r.llm.Embed(ctx, r.cfg.EmbedModel, query, r.cfg.EmbedDim)
+	if err != nil {
+		return nil, err
+	}
+	return r.retrieve(ctx, query, qvec, topK)
 }
 
 // retrieve 做混合检索：向量检索 + 关键词检索，用 RRF（倒数排名融合）合并。
 func (r *RAG) retrieve(ctx context.Context, q string, qvec []float32, n int) ([]store.Retrieved, error) {
-	vecRes, err := r.store.VectorSearch(ctx, qvec, n)
+	vecRes, err := r.store.VectorSearch(ctx, r.cfg.Namespace, qvec, n)
 	if err != nil {
 		return nil, err
 	}
-	kwRes, err := r.store.KeywordSearch(ctx, q, n)
+	kwRes, err := r.store.KeywordSearch(ctx, r.cfg.Namespace, q, n)
 	if err != nil {
 		return nil, err
 	}
@@ -169,7 +186,7 @@ func (r *RAG) rerank(ctx context.Context, q string, cands []store.Retrieved, k i
 }
 
 // generate 把上下文和问题拼进 prompt，交给 LLM 生成答案。
-func (r *RAG) generate(ctx context.Context, q string, ctxChunks []store.Retrieved) (string, error) {
+func (r *RAG) generate(ctx context.Context, q string, ctxChunks []store.Retrieved, onDelta func(string) error) (string, error) {
 	var sb strings.Builder
 	sb.WriteString("你是一个 Go 语言文档助手。请只根据下面提供的资料回答用户问题。\n")
 	sb.WriteString("如果资料中找不到答案，请明确说「根据现有资料无法回答」，不要编造。\n\n")
@@ -183,10 +200,18 @@ func (r *RAG) generate(ctx context.Context, q string, ctxChunks []store.Retrieve
 	}
 	sb.WriteString("\n问题：" + q + "\n")
 
-	return r.llm.Chat(ctx, r.cfg.LLMModel, []llm.Message{
+	msgs := []llm.Message{
 		{Role: "system", Content: "你是严谨、只依据给定资料作答的 Go 文档助手。"},
 		{Role: "user", Content: sb.String()},
-	})
+	}
+	if onDelta != nil {
+		msg, err := r.llm.StreamChat(ctx, r.cfg.LLMModel, msgs, nil, onDelta)
+		if err != nil {
+			return "", err
+		}
+		return msg.Content, nil
+	}
+	return r.llm.Chat(ctx, r.cfg.LLMModel, msgs)
 }
 
 // ---------- 工具函数 ----------

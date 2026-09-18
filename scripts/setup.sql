@@ -12,12 +12,16 @@ CREATE EXTENSION IF NOT EXISTS vector;
 -- 注意：vector(1024) 的维度必须和 .env 里 EMBED_DIM 一致（默认 1024）
 CREATE TABLE IF NOT EXISTS chunks (
     id         BIGSERIAL PRIMARY KEY,
+    namespace  TEXT NOT NULL DEFAULT 'go-docs', -- 知识库命名空间（多知识库隔离）
     source     TEXT NOT NULL,                 -- 来源文件名
     section    TEXT NOT NULL DEFAULT '',      -- 所属 markdown 标题
     content    TEXT NOT NULL,                 -- 文本内容
     embedding  vector(1024) NOT NULL,         -- 向量
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- 多知识库：按命名空间过滤的索引
+CREATE INDEX IF NOT EXISTS chunks_namespace_idx ON chunks (namespace);
 
 -- 3) 向量检索索引（HNSW，余弦距离）
 -- 如果你的 pgvector 版本较老（< 0.5.0）不支持 HNSW，改用下面注释里的 IVFFlat：

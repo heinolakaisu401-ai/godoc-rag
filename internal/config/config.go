@@ -12,6 +12,7 @@ import (
 type Config struct {
 	DashscopeAPIKey  string
 	DashscopeBaseURL string
+	WebSearchAPIKey  string // 博查联网搜索 key（可选，不填则不注册该工具）
 	LLMModel         string
 	EmbedModel       string
 	EmbedDim         int
@@ -33,6 +34,7 @@ func Load() (*Config, error) {
 	return &Config{
 		DashscopeAPIKey:  os.Getenv("DASHSCOPE_API_KEY"),
 		DashscopeBaseURL: getenv("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+		WebSearchAPIKey:  getenv("WEB_SEARCH_API_KEY", ""),
 		LLMModel:         getenv("LLM_MODEL", "qwen-plus"),
 		EmbedModel:       getenv("EMBED_MODEL", "text-embedding-v3"),
 		EmbedDim:         getenvInt("EMBED_DIM", 1024),
