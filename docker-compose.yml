@@ -5,7 +5,8 @@ services:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: godoc_rag
     ports:
-      - "5432:5432"
+      # 只绑本机回环，避免 5432 暴露公网（server 走 docker 内网连 db，不依赖这个端口）
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
       # 首次启动自动建表（只在数据卷为空时执行一次）
@@ -18,6 +19,7 @@ services:
 
   server:
     build: .
+    restart: unless-stopped
     environment:
       DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY}
       DASHSCOPE_BASE_URL: https://dashscope.aliyuncs.com/compatible-mode/v1
@@ -26,6 +28,7 @@ services:
       EMBED_DIM: "1024"
       DATABASE_URL: postgres://postgres:postgres@db:5432/godoc_rag?sslmode=disable
       SERVER_PORT: "8080"
+      WEB_SEARCH_API_KEY: ${WEB_SEARCH_API_KEY}
     ports:
       - "8080:8080"
     depends_on:
